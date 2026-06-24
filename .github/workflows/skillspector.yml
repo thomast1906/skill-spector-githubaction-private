@@ -14,7 +14,7 @@ on:
         required: false
         default: ""
       use_llm:
-        description: "Enable LLM semantic analysis via OpenAI"
+        description: "Enable LLM semantic analysis"
         required: false
         default: "true"
         type: choice
@@ -56,28 +56,30 @@ jobs:
             echo "path=." >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Run SkillSpector (static + LLM)
-        id: scan
+      - name: Run SkillSpector — SARIF (with LLM)
+        id: scan_sarif
         env:
-          SKILLSPECTOR_PROVIDER: ${{ secrets.SKILLSPECTOR_PROVIDER || 'openai' }}
+          SKILLSPECTOR_PROVIDER: ${{ secrets.SKILLSPECTOR_PROVIDER != '' && secrets.SKILLSPECTOR_PROVIDER || 'openai' }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           SKILLSPECTOR_MODEL: ${{ secrets.SKILLSPECTOR_MODEL }}
         run: |
-          USE_LLM="${{ github.event.inputs.use_llm }}"
           TARGET="${{ steps.target.outputs.path }}"
           LLM_FLAG=""
 
-          # Disable LLM if explicitly requested or if the secret is absent
-          if [ "$USE_LLM" = "false" ] || [ -z "$OPENAI_API_KEY" ]; then
+          if [ "${{ github.event.inputs.use_llm }}" = "false" ] || [ -z "$OPENAI_API_KEY" ]; then
             LLM_FLAG="--no-llm"
-            echo "LLM analysis disabled (no key or explicitly disabled)"
+            echo "LLM disabled (no key or explicitly disabled)"
           fi
 
-          uv tool run skillspector scan "$TARGET" $LLM_FLAG \
+          skillspector scan "$TARGET" $LLM_FLAG \
             --format sarif --output skillspector-results.sarif
 
-          uv tool run skillspector scan "$TARGET" $LLM_FLAG \
+      - name: Run SkillSpector — Markdown report (static only)
+        if: always()
+        run: |
+          TARGET="${{ steps.target.outputs.path }}"
+          skillspector scan "$TARGET" --no-llm \
             --format markdown --output skillspector-report.md
 
       - name: Upload SARIF to GitHub Code Scanning
@@ -102,3 +104,4 @@ jobs:
         run: |
           echo "## SkillSpector Report" >> "$GITHUB_STEP_SUMMARY"
           cat skillspector-report.md >> "$GITHUB_STEP_SUMMARY"
+
