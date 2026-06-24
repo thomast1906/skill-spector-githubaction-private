@@ -1,0 +1,216 @@
+name: SkillSpector PR Skills Scan
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - ".github/workflows/skills/**"
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  skillspector-pr-skills:
+    name: Scan changed skill folders
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install SkillSpector
+        run: uv tool install "git+https://github.com/NVIDIA/skillspector.git"
+
+      - name: Scan changed skill directories and build PR report
+        id: scan
+        env:
+          SKILLSPECTOR_PROVIDER: ${{ secrets.SKILLSPECTOR_PROVIDER != '' && secrets.SKILLSPECTOR_PROVIDER || 'openai' }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          SKILLSPECTOR_MODEL: ${{ secrets.SKILLSPECTOR_MODEL }}
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          TARGET_ROOT=".github/workflows/skills"
+
+          mkdir -p skillspector-pr-reports
+
+          mapfile -t CHANGED_FILES < <(git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" -- "$TARGET_ROOT")
+
+          MARKER="<!-- skillspector-pr-skills -->"
+
+          if [ "${#CHANGED_FILES[@]}" -eq 0 ]; then
+            echo "No added/updated files found under ${TARGET_ROOT}."
+            {
+              echo "$MARKER"
+              echo "## SkillSpector PR Skills Scan"
+              echo ""
+              echo "No added/updated files found under \`${TARGET_ROOT}\`."
+            } > skillspector-pr-reports/summary.md
+            exit 0
+          fi
+
+          declare -A SEEN_DIRS=()
+          SKILL_DIRS=()
+
+          for file in "${CHANGED_FILES[@]}"; do
+            rel="${file#${TARGET_ROOT}/}"
+            skill_name="${rel%%/*}"
+
+            if [ -z "$skill_name" ] || [ "$skill_name" = "$rel" ]; then
+              continue
+            fi
+
+            dir="${TARGET_ROOT}/${skill_name}"
+            if [ -d "$dir" ] && [ -z "${SEEN_DIRS[$dir]+x}" ]; then
+              SEEN_DIRS[$dir]=1
+              SKILL_DIRS+=("$dir")
+            fi
+          done
+
+          if [ "${#SKILL_DIRS[@]}" -eq 0 ]; then
+            {
+              echo "$MARKER"
+              echo "## SkillSpector PR Skills Scan"
+              echo ""
+              echo "Changes were detected under \`${TARGET_ROOT}\`, but no skill directories were available to scan."
+            } > skillspector-pr-reports/summary.md
+            exit 0
+          fi
+
+          LLM_FLAG=""
+          LLM_MODE="enabled"
+          if [ -z "$OPENAI_API_KEY" ]; then
+            LLM_FLAG="--no-llm"
+            LLM_MODE="disabled (OPENAI_API_KEY not set)"
+            echo "LLM disabled (OPENAI_API_KEY not set)."
+          fi
+
+          HIGH_RISK_FOUND=0
+
+          {
+            echo "$MARKER"
+            echo "## SkillSpector PR Skills Scan"
+            echo ""
+            echo "- Base SHA: \`$BASE_SHA\`"
+            echo "- Head SHA: \`$HEAD_SHA\`"
+            echo "- LLM: $LLM_MODE"
+            echo ""
+            echo "Scanned directories:"
+            for dir in "${SKILL_DIRS[@]}"; do
+              echo "- \`${dir}\`"
+            done
+            echo ""
+            echo "---"
+            echo ""
+          } > skillspector-pr-reports/summary.md
+
+          for dir in "${SKILL_DIRS[@]}"; do
+            slug="$(echo "$dir" | tr '/.' '__')"
+
+            set +e
+            skillspector scan "$dir" $LLM_FLAG --format markdown --output "skillspector-pr-reports/${slug}.md"
+            MD_EXIT=$?
+            set -e
+
+            if [ "$MD_EXIT" -eq 2 ]; then
+              echo "Failed generating markdown report for ${dir}."
+              exit 2
+            fi
+
+            if [ "$MD_EXIT" -eq 1 ]; then
+              HIGH_RISK_FOUND=1
+            fi
+
+            {
+              echo "### \`${dir}\`"
+              echo ""
+              cat "skillspector-pr-reports/${slug}.md"
+              echo ""
+              echo "---"
+              echo ""
+            } >> skillspector-pr-reports/summary.md
+          done
+
+          if [ "$HIGH_RISK_FOUND" -eq 1 ]; then
+            {
+              echo "High-risk findings were detected in one or more changed skill directories."
+              echo "Review the report sections above before merging."
+            } >> skillspector-pr-reports/summary.md
+          else
+            echo "No DO_NOT_INSTALL outcome detected in changed skill directories." >> skillspector-pr-reports/summary.md
+          fi
+
+          COMMENT_MAX=65000
+          CURRENT_SIZE=$(wc -c < skillspector-pr-reports/summary.md | tr -d ' ')
+          if [ "$CURRENT_SIZE" -gt "$COMMENT_MAX" ]; then
+            {
+              echo ""
+              echo "> ⚠️ Report was truncated to fit GitHub PR comment limits."
+            } > skillspector-pr-reports/truncation-note.md
+            head -c "$COMMENT_MAX" skillspector-pr-reports/summary.md > skillspector-pr-reports/pr-comment.md
+            cat skillspector-pr-reports/truncation-note.md >> skillspector-pr-reports/pr-comment.md
+          else
+            cp skillspector-pr-reports/summary.md skillspector-pr-reports/pr-comment.md
+          fi
+
+      - name: Create or update PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const marker = "<!-- skillspector-pr-skills -->";
+            const fallback = `${marker}\n## SkillSpector PR Skills Scan\n\nThe scan step failed before a full report could be generated. Check the workflow logs.`;
+            const body = fs.existsSync("skillspector-pr-reports/pr-comment.md")
+              ? fs.readFileSync("skillspector-pr-reports/pr-comment.md", "utf8")
+              : fallback;
+            const issue_number = context.payload.pull_request.number;
+            const { owner, repo } = context.repo;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+
+            const existing = comments.find(c => c.user?.type === "Bot" && c.body?.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
+
+      - name: Print summary to job log
+        if: always()
+        run: |
+          if [ -f skillspector-pr-reports/pr-comment.md ]; then
+            cat skillspector-pr-reports/pr-comment.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## SkillSpector PR Skills Scan" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Report was not generated. Check earlier step logs." >> "$GITHUB_STEP_SUMMARY"
+          fi
