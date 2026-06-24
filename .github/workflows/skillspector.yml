@@ -59,8 +59,10 @@ jobs:
       - name: Run SkillSpector (static + LLM)
         id: scan
         env:
-          SKILLSPECTOR_PROVIDER: openai
+          SKILLSPECTOR_PROVIDER: ${{ secrets.SKILLSPECTOR_PROVIDER || 'openai' }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          SKILLSPECTOR_MODEL: ${{ secrets.SKILLSPECTOR_MODEL }}
         run: |
           USE_LLM="${{ github.event.inputs.use_llm }}"
           TARGET="${{ steps.target.outputs.path }}"
