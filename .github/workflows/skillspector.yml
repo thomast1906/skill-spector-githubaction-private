@@ -1,0 +1,102 @@
+name: SkillSpector Security Scan
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "0 6 * * 1" # Every Monday at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Target to scan (git URL, file path, or leave blank to scan this repo)"
+        required: false
+        default: ""
+      use_llm:
+        description: "Enable LLM semantic analysis via OpenAI"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+  security-events: write # Required to upload SARIF to GitHub Code Scanning
+
+jobs:
+  skillspector:
+    name: SkillSpector Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install SkillSpector
+        run: uv tool install "git+https://github.com/NVIDIA/skillspector.git"
+
+      - name: Determine scan target
+        id: target
+        run: |
+          INPUT="${{ github.event.inputs.target }}"
+          if [ -n "$INPUT" ]; then
+            echo "path=$INPUT" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=." >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run SkillSpector (static + LLM)
+        id: scan
+        env:
+          SKILLSPECTOR_PROVIDER: openai
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          USE_LLM="${{ github.event.inputs.use_llm }}"
+          TARGET="${{ steps.target.outputs.path }}"
+          LLM_FLAG=""
+
+          # Disable LLM if explicitly requested or if the secret is absent
+          if [ "$USE_LLM" = "false" ] || [ -z "$OPENAI_API_KEY" ]; then
+            LLM_FLAG="--no-llm"
+            echo "LLM analysis disabled (no key or explicitly disabled)"
+          fi
+
+          uv tool run skillspector scan "$TARGET" $LLM_FLAG \
+            --format sarif --output skillspector-results.sarif
+
+          uv tool run skillspector scan "$TARGET" $LLM_FLAG \
+            --format markdown --output skillspector-report.md
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: skillspector-results.sarif
+          category: skillspector
+
+      - name: Upload reports as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skillspector-reports
+          path: |
+            skillspector-results.sarif
+            skillspector-report.md
+          retention-days: 30
+
+      - name: Print summary to job log
+        if: always()
+        run: |
+          echo "## SkillSpector Report" >> "$GITHUB_STEP_SUMMARY"
+          cat skillspector-report.md >> "$GITHUB_STEP_SUMMARY"
