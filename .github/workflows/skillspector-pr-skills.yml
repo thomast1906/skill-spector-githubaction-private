@@ -5,11 +5,19 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - ".github/workflows/skills/**"
+      # Add one entry per root listed in TARGET_ROOTS below so the workflow
+      # only triggers when files under those paths actually change.
+      # - "skills/**"
+      # - "agents/skills/**"
 
 permissions:
   contents: read
   issues: write
   pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   skillspector-pr-skills:
@@ -18,20 +26,22 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
 
       - name: Install SkillSpector
-        run: uv tool install "git+https://github.com/NVIDIA/skillspector.git"
+        # Pinned to a commit SHA: upstream has no tagged releases yet, only branches.
+        # Re-pin periodically to pick up fixes/updates.
+        run: uv tool install "git+https://github.com/NVIDIA/skillspector.git@326a2b489411a20ed742ff13701be39ba00063c8"
 
       - name: Scan changed skill directories and build PR report
         id: scan
@@ -43,21 +53,24 @@ jobs:
         run: |
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-          TARGET_ROOT=".github/workflows/skills"
+          # One or more roots to scan for changed skill folders. Keep this in
+          # sync with the `paths:` filter above.
+          TARGET_ROOTS=(".github/workflows/skills")
 
           mkdir -p skillspector-pr-reports
 
-          mapfile -t CHANGED_FILES < <(git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" -- "$TARGET_ROOT")
+          mapfile -t CHANGED_FILES < <(git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" -- "${TARGET_ROOTS[@]}")
 
           MARKER="<!-- skillspector-pr-skills -->"
+          ROOTS_LIST="$(IFS=', '; echo "${TARGET_ROOTS[*]}")"
 
           if [ "${#CHANGED_FILES[@]}" -eq 0 ]; then
-            echo "No added/updated files found under ${TARGET_ROOT}."
+            echo "No added/updated files found under: ${ROOTS_LIST}."
             {
               echo "$MARKER"
               echo "## SkillSpector PR Skills Scan"
               echo ""
-              echo "No added/updated files found under \`${TARGET_ROOT}\`."
+              echo "No added/updated files found under: \`${ROOTS_LIST}\`."
             } > skillspector-pr-reports/summary.md
             exit 0
           fi
@@ -66,18 +79,25 @@ jobs:
           SKILL_DIRS=()
 
           for file in "${CHANGED_FILES[@]}"; do
-            rel="${file#${TARGET_ROOT}/}"
-            skill_name="${rel%%/*}"
+            for root in "${TARGET_ROOTS[@]}"; do
+              case "$file" in
+                "$root"/*)
+                  rel="${file#${root}/}"
+                  skill_name="${rel%%/*}"
 
-            if [ -z "$skill_name" ] || [ "$skill_name" = "$rel" ]; then
-              continue
-            fi
+                  if [ -z "$skill_name" ] || [ "$skill_name" = "$rel" ]; then
+                    break
+                  fi
 
-            dir="${TARGET_ROOT}/${skill_name}"
-            if [ -d "$dir" ] && [ -z "${SEEN_DIRS[$dir]+x}" ]; then
-              SEEN_DIRS[$dir]=1
-              SKILL_DIRS+=("$dir")
-            fi
+                  dir="${root}/${skill_name}"
+                  if [ -d "$dir" ] && [ -z "${SEEN_DIRS[$dir]+x}" ]; then
+                    SEEN_DIRS[$dir]=1
+                    SKILL_DIRS+=("$dir")
+                  fi
+                  break
+                  ;;
+              esac
+            done
           done
 
           if [ "${#SKILL_DIRS[@]}" -eq 0 ]; then
@@ -85,7 +105,7 @@ jobs:
               echo "$MARKER"
               echo "## SkillSpector PR Skills Scan"
               echo ""
-              echo "Changes were detected under \`${TARGET_ROOT}\`, but no skill directories were available to scan."
+              echo "Changes were detected under \`${ROOTS_LIST}\`, but no skill directories were available to scan."
             } > skillspector-pr-reports/summary.md
             exit 0
           fi
@@ -168,7 +188,7 @@ jobs:
 
       - name: Create or update PR comment
         if: always()
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const fs = require("fs");

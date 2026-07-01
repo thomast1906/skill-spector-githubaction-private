@@ -25,7 +25,11 @@ on:
 permissions:
   actions: read
   contents: read
-  security-events: write # Required to upload SARIF to GitHub Code Scanning
+  security-events: write # Required to upload SARIF to GitHub Code Scanning; note this has no effect on pull_request runs from forks (GITHUB_TOKEN is read-only there), so SARIF upload is skipped for fork PRs.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   skillspector:
@@ -34,18 +38,20 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
 
       - name: Install SkillSpector
-        run: uv tool install "git+https://github.com/NVIDIA/skillspector.git"
+        # Pinned to a commit SHA: upstream has no tagged releases yet, only branches.
+        # Re-pin periodically to pick up fixes/updates.
+        run: uv tool install "git+https://github.com/NVIDIA/skillspector.git@326a2b489411a20ed742ff13701be39ba00063c8"
 
       - name: Determine scan target
         id: target
@@ -88,40 +94,26 @@ jobs:
             echo "SkillSpector reported DO_NOT_INSTALL findings; continuing to upload reports."
           fi
 
-      - name: Run SkillSpector — Markdown report (static only)
-        if: always()
-        run: |
-          TARGET="${{ steps.target.outputs.path }}"
-          set +e
-          skillspector scan "$TARGET" --no-llm \
-            --format markdown --output skillspector-report.md
-          SCAN_EXIT=$?
-          set -e
-
-          if [ "$SCAN_EXIT" -eq 2 ]; then
-            echo "SkillSpector markdown report generation failed due to an execution/input error."
-            exit 2
-          fi
-
       - name: Upload SARIF to GitHub Code Scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
         with:
           sarif_file: skillspector-results.sarif
           category: skillspector
 
       - name: Upload reports as artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: skillspector-reports
-          path: |
-            skillspector-results.sarif
-            skillspector-report.md
+          path: skillspector-results.sarif
           retention-days: 30
 
       - name: Print summary to job log
         if: always()
         run: |
-          echo "## SkillSpector Report" >> "$GITHUB_STEP_SUMMARY"
-          cat skillspector-report.md >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## SkillSpector Report"
+            echo ""
+            echo "Full SARIF results uploaded to the Security tab (category: \`skillspector\`, if permissions allow) and attached as the \`skillspector-reports\` workflow artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
